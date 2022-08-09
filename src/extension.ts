@@ -2361,7 +2361,7 @@ export function activate(context: vscode.ExtensionContext) {
 	initializeParams.processId = process.pid;
 	initializeParams.clientInfo = {
 		name: "FModSilo-VSCode",
-		version: "0.1"
+		version: "0.2"
 	};
 	initializeParams.workspaceFolders = [];
 	if (vscode.workspace.workspaceFolders)

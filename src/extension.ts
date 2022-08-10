@@ -2024,6 +2024,95 @@ module lsp
 		failureReason?: string;
 		failedChange?: uinteger;
 	}
+
+	// Create files
+	/**
+	 * The parameters sent in notifications/requests for user-initiated creation
+	 * of files.
+	 *
+	 * @since 3.16.0
+	*/
+	export interface CreateFilesParams {
+
+		/**
+		 * An array of all files/folders created in this operation.
+		 */
+		files: FileCreate[];
+	}
+
+	/**
+	 * Represents information on a file/folder create.
+	 *
+	 * @since 3.16.0
+	*/
+	export interface FileCreate {
+
+		/**
+		 * A file:// URI for the location of the file/folder being created.
+		 */
+		uri: string;
+	}
+
+	// Rename files
+	/**
+	 * The parameters sent in notifications/requests for user-initiated renames
+	 * of files.
+	 *
+	 * @since 3.16.0
+	 */
+	export interface RenameFilesParams {
+
+		/**
+		 * An array of all files/folders renamed in this operation. When a folder
+		 * is renamed, only the folder will be included, and not its children.
+		 */
+		files: FileRename[];
+	}
+
+	/**
+	 * Represents information on a file/folder rename.
+	 *
+	 * @since 3.16.0
+	 */
+	export interface FileRename {
+
+		/**
+		 * A file:// URI for the original location of the file/folder being renamed.
+		 */
+		oldUri: string;
+
+		/**
+		 * A file:// URI for the new location of the file/folder being renamed.
+		 */
+		newUri: string;
+	}
+
+	/**
+	 * The parameters sent in notifications/requests for user-initiated deletes
+	 * of files.
+	 *
+	 * @since 3.16.0
+	 */
+	export interface DeleteFilesParams {
+
+		/**
+		 * An array of all files/folders deleted in this operation.
+		 */
+		files: FileDelete[];
+	}
+
+	/**
+	 * Represents information on a file/folder delete.
+	 *
+	 * @since 3.16.0
+	 */
+	export interface FileDelete {
+
+		/**
+		 * A file:// URI for the location of the file/folder being deleted.
+		 */
+		uri: string;
+	}
 }
 // eslint-disable-next-line @typescript-eslint/naming-convention
 export type integer = number;
@@ -2250,33 +2339,98 @@ function onInitializeResponse(request: lsp.RequestMessage, response?: lsp.Respon
 	if (result)
 	{
 		serverCababilities = result.capabilities;
+		console.log(serverCababilities);
 
-		if (serverCababilities.workspace?.workspaceFolders?.changeNotifications)
+		if (serverCababilities.workspace)
 		{
-			vscode.workspace.onDidChangeWorkspaceFolders((e: vscode.WorkspaceFoldersChangeEvent) => {
-				let params: lsp.DidChangeWorkspaceFoldersParams = <lsp.DidChangeWorkspaceFoldersParams>{};
-				params.event = <lsp.WorkspaceFolderChangeEvent>{};
-				params.event.added = [];
-				params.event.removed = [];
-				
-				for (let i = 0; i < e.added.length; i++)
+			let workspace = serverCababilities.workspace;
+
+			if (workspace.workspaceFolders)
+			{
+				let workspaceFolders = workspace.workspaceFolders;
+
+				if (workspaceFolders.changeNotifications)
 				{
-					params.event.added[i] = <lsp.WorkspaceFolder>{
-						uri: e.added[i].uri.toString(),
-						name: e.added[i].name
-					};
+					vscode.workspace.onDidChangeWorkspaceFolders(e => {
+						let params: lsp.DidChangeWorkspaceFoldersParams = <lsp.DidChangeWorkspaceFoldersParams>{};
+						params.event = <lsp.WorkspaceFolderChangeEvent>{};
+						params.event.added = [];
+						params.event.removed = [];
+						
+						for (let i = 0; i < e.added.length; i++)
+						{
+							params.event.added[i] = <lsp.WorkspaceFolder>{
+								uri: e.added[i].uri.toString(),
+								name: e.added[i].name
+							};
+						}
+					
+						for (let i = 0; i < e.removed.length; i++)
+						{
+							params.event.removed[i] = <lsp.WorkspaceFolder>{
+								uri: e.removed[i].uri.toString(),
+								name: e.removed[i].name
+							};
+						}
+		
+						sendNotification("workspace/didChangeWorkspaceFolders", params);
+					});
 				}
-			
-				for (let i = 0; i < e.removed.length; i++)
+			}
+
+			if (workspace.fileOperations)
+			{
+				let fileOperations = workspace.fileOperations;
+				console.log("Hi");
+
+				if (fileOperations.didCreate)
 				{
-					params.event.removed[i] = <lsp.WorkspaceFolder>{
-						uri: e.removed[i].uri.toString(),
-						name: e.removed[i].name
-					};
+					vscode.workspace.onDidCreateFiles(e => {
+						let params = <lsp.CreateFilesParams> {};
+
+						params.files = [];
+
+						e.files.forEach(uri => {
+							params.files.push(<lsp.FileCreate>{uri: uri.toString(true)});
+						});
+
+						sendNotification("workspace/didCreateFiles");
+					});
 				}
 
-				sendNotification("workspace/didChangeWorkspaceFolders", params);
-			});
+				if (fileOperations.didRename)
+				{
+					vscode.workspace.onDidRenameFiles(e => {
+						let params = <lsp.RenameFilesParams> {};
+
+						params.files = [];
+
+						e.files.forEach(uri => {
+							params.files.push(<lsp.FileRename>{
+								oldUri: uri.oldUri.toString(true),
+								newUri: uri.newUri.toString(true)
+							});
+						});
+
+						sendNotification("workspace/didRenameFiles");
+					});
+				}
+
+				if (fileOperations.didDelete)
+				{
+					vscode.workspace.onDidDeleteFiles(e => {
+						let params = <lsp.DeleteFilesParams> {};
+
+						params.files = [];
+
+						e.files.forEach(uri => {
+							params.files.push(<lsp.FileDelete>{uri: uri.toString(true)});
+						});
+
+						sendNotification("workspace/didDeleteFiles");
+					});
+				}
+			}
 		}
 
 		sendNotification("initialized", {});
@@ -2381,7 +2535,13 @@ export function activate(context: vscode.ExtensionContext) {
 	initializeParams.trace = 'verbose';
 	initializeParams.capabilities = <lsp.ClientCapabilities>{
 		workspace: {
-			workspaceFolders: true
+			workspaceFolders: true,
+			fileOperations: {
+				dynamicRegistration: false,
+				didCreate: true,
+				didRename: true,
+				didDelete: true
+			}
 		},
 		textDocument: <lsp.TextDocumentClientCapabilities>{
 			publishDiagnostics: <lsp.PublishDiagnosticsClientCapabilities>{

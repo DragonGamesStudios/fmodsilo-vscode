@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import * as child_process from 'child_process';
 import { randomUUID } from 'crypto';
+import { glob } from 'glob';
+import { IMinimatch, Minimatch } from 'minimatch';
+import { FileOperationFilter } from 'vscode-languageserver-protocol/lib/common/protocol.fileOperations';
 
 module lsp
 {
@@ -284,7 +287,7 @@ module lsp
 		kind: 'create';
 		uri: DocumentUri;
 		options?: CreateFileOptions;
-		annotationId: ChangeAnnotationIdentifier;
+		annotationId?: ChangeAnnotationIdentifier;
 	}
 
 	export interface RenameFileOptions
@@ -319,10 +322,7 @@ module lsp
 	export interface WorkspaceEdit
 	{
 		changes?: { [uri: DocumentUri]: TextEdit[]; };
-		documentChanges?: (
-			TextDocumentEdit[] |
-			(TextDocumentEdit | CreateFile | RenameFile | DeleteFile)[]
-		);
+		documentChanges?: (TextDocumentEdit | CreateFile | RenameFile | DeleteFile)[];
 		changeAnnotations?: {
 			[id: ChangeAnnotationIdentifier]: ChangeAnnotation;
 		};
@@ -406,8 +406,16 @@ module lsp
 
 	export interface FileSystemWatcher
 	{
-		globPattern: string;
+		globPattern: GlobPattern;
 		kind?: uinteger;
+	}
+
+	export type GlobPattern = Pattern | RelativePattern;
+	export type Pattern = string;
+	export interface RelativePattern
+	{
+		baseUri: WorkspaceFolder | URI;
+		pattern: Pattern;
 	}
 
 	export namespace SymbolKind
@@ -1671,6 +1679,7 @@ module lsp
 	export interface DidChangeWatchedFilesClientCapabilities
 	{
 		dynamicRegistration?: boolean;
+		relativePatternSupport?: boolean
 	}
 
 	export namespace WatchKind
@@ -1688,7 +1697,7 @@ module lsp
 
 	export interface DidChangeWatchedFilesParams
 	{
-		changes: FileEvent;
+		changes: FileEvent[];
 	}
 
 	export namespace FileChangeType
@@ -1787,7 +1796,7 @@ module lsp
 			applyEdit?: boolean;
 			workspaceEdit?: WorkspaceEditClientCapabilities;
 			didChangeConfiguration?: boolean;
-			didChangeWatchedFiles?: DidChangeWatchedFilesRegistrationOptions;
+			didChangeWatchedFiles?: DidChangeWatchedFilesClientCapabilities;
 			symbol?: WorkspaceSymbolClientCapabilities;
 			executeCommand?: ExecuteCommandClientCapabilities;
 			workspaceFolders?: boolean;
@@ -2140,16 +2149,20 @@ let traceOutput: vscode.OutputChannel;
 
 let notificationListeners: Map<string, (params?: any[] | object) => void> = new Map<string, () => void>();
 let requestListeners: Map<string, (params?: any[] | object) =>ClientResponse> = new Map<string, (params?: any[] | object) =>ClientResponse>();
-let responseListeners: Map<string, (request : lsp.RequestMessage, respomse?: lsp.ResponseMessage) => boolean>
+let responseListeners: Map<string, (request : lsp.RequestMessage, response?: lsp.ResponseMessage) => boolean>
 	= new Map<string, (request : lsp.RequestMessage, response?: lsp.ResponseMessage) => boolean>();
 
 let pendingRequests: Map<integer | string, lsp.RequestMessage> = new Map<integer | string, lsp.RequestMessage>();
+
+let dynamicCapabilities: Map<string, {method: string, meta: any}> = new Map<string, {method: string, meta: any}>();
 
 const _DEBUG = true;
 
 let config = vscode.workspace.getConfiguration("fmodsilo");
 let path: string | undefined = config.get("serverExecutablePath");
 let fserver: child_process.ChildProcess;
+
+let watcher: vscode.FileSystemWatcher;
 
 async function sendRequest(method: string, params?: any[] | object)
 {
@@ -2333,13 +2346,26 @@ mainwhile:
 
 let serverCababilities: lsp.ServerCapabilities;
 
+function getFilters(filters: FileOperationFilter[]): IMinimatch[]
+{
+	let matchmakers: IMinimatch[] = [];
+
+	filters.forEach(filter => {
+		matchmakers.push(new Minimatch(filter.pattern.glob, {
+			nocase: filter.pattern.options?.ignoreCase,
+			dot: true
+		}));
+	});
+
+	return matchmakers;
+}
+
 function onInitializeResponse(request: lsp.RequestMessage, response?: lsp.ResponseMessage): boolean
 {
 	let result = response?.result as lsp.InitializeResult;
 	if (result)
 	{
 		serverCababilities = result.capabilities;
-		console.log(serverCababilities);
 
 		if (serverCababilities.workspace)
 		{
@@ -2349,7 +2375,7 @@ function onInitializeResponse(request: lsp.RequestMessage, response?: lsp.Respon
 			{
 				let workspaceFolders = workspace.workspaceFolders;
 
-				if (workspaceFolders.changeNotifications)
+				if (workspaceFolders.changeNotifications !== false)
 				{
 					vscode.workspace.onDidChangeWorkspaceFolders(e => {
 						let params: lsp.DidChangeWorkspaceFoldersParams = <lsp.DidChangeWorkspaceFoldersParams>{};
@@ -2381,53 +2407,314 @@ function onInitializeResponse(request: lsp.RequestMessage, response?: lsp.Respon
 			if (workspace.fileOperations)
 			{
 				let fileOperations = workspace.fileOperations;
-				console.log("Hi");
 
 				if (fileOperations.didCreate)
 				{
-					vscode.workspace.onDidCreateFiles(e => {
+					let didCreate = fileOperations.didCreate;
+
+					vscode.workspace.onDidCreateFiles(async e => {
 						let params = <lsp.CreateFilesParams> {};
 
 						params.files = [];
 
-						e.files.forEach(uri => {
-							params.files.push(<lsp.FileCreate>{uri: uri.toString(true)});
-						});
+						let matchmakers = getFilters(didCreate.filters);
 
-						sendNotification("workspace/didCreateFiles");
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < didCreate.filters.length; ++index)
+							{
+								let filter = didCreate.filters[index];
+								if (filter.scheme && filter.scheme === uri.scheme)
+								{
+									if (matchmakers[index].match(uri.path))
+									{
+										if (filter.pattern.matches === 'file')
+										{
+											let entry = await vscode.workspace.fs.stat(uri);
+
+											if (entry.type & vscode.FileType.File)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === 'folder')
+										{
+											let entry = await vscode.workspace.fs.stat(uri);
+											if (entry.type & vscode.FileType.Directory)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === undefined)
+										{
+											found = true;
+											break;
+										}
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileCreate>{uri: uri.toString(true)});
+							}
+						}
+
+						sendNotification("workspace/didCreateFiles", params);
 					});
 				}
 
 				if (fileOperations.didRename)
 				{
-					vscode.workspace.onDidRenameFiles(e => {
+					let didRename = fileOperations.didRename;
+
+					vscode.workspace.onDidRenameFiles(async e => {
 						let params = <lsp.RenameFilesParams> {};
 
 						params.files = [];
 
-						e.files.forEach(uri => {
-							params.files.push(<lsp.FileRename>{
-								oldUri: uri.oldUri.toString(true),
-								newUri: uri.newUri.toString(true)
-							});
-						});
+						let matchmakers = getFilters(didRename.filters);
 
-						sendNotification("workspace/didRenameFiles");
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < didRename.filters.length; ++index)
+							{
+								let filter = didRename.filters[index];
+								if (filter.scheme && filter.scheme === uri.oldUri.scheme)
+								{
+									if (matchmakers[index].match(uri.oldUri.path))
+									{
+										if (filter.pattern.matches === 'file')
+										{
+											let entry = await vscode.workspace.fs.stat(uri.newUri);
+
+											if (entry.type & vscode.FileType.File)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === 'folder')
+										{
+											let entry = await vscode.workspace.fs.stat(uri.newUri);
+											if (entry.type & vscode.FileType.Directory)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === undefined)
+										{
+											found = true;
+											break;
+										}
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileRename>{oldUri: uri.oldUri.toString(true), newUri: uri.newUri.toString()});
+							}
+						}
+
+						sendNotification("workspace/didRenameFiles", params);
 					});
 				}
 
 				if (fileOperations.didDelete)
-				{
-					vscode.workspace.onDidDeleteFiles(e => {
+				{	
+					let didDelete = fileOperations.didDelete;
+
+					vscode.workspace.onDidDeleteFiles(async e => {
 						let params = <lsp.DeleteFilesParams> {};
 
 						params.files = [];
 
-						e.files.forEach(uri => {
-							params.files.push(<lsp.FileDelete>{uri: uri.toString(true)});
-						});
+						let matchmakers = getFilters(didDelete.filters);
 
-						sendNotification("workspace/didDeleteFiles");
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < didDelete.filters.length; ++index)
+							{
+								let filter = didDelete.filters[index];
+								if (filter.scheme && filter.scheme === uri.scheme)
+								{
+									if (matchmakers[index].match(uri.path))
+									{
+										found = true;
+										break;
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileDelete>{uri: uri.toString(true)});
+							}
+						}
+
+						sendNotification("workspace/didDeleteFiles", params);
+					});
+				}
+
+				if (fileOperations.willCreate)
+				{
+					let willCreate = fileOperations.willCreate;
+
+					vscode.workspace.onWillCreateFiles(async e => {
+						let params = <lsp.CreateFilesParams> {};
+
+						params.files = [];
+
+						let matchmakers = getFilters(willCreate.filters);
+
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < willCreate.filters.length; ++index)
+							{
+								let filter = willCreate.filters[index];
+								if (filter.scheme && filter.scheme === uri.scheme)
+								{
+									if (matchmakers[index].match(uri.path))
+									{
+										if (filter.pattern.matches === 'file')
+										{
+											let entry = await vscode.workspace.fs.stat(uri);
+
+											if (entry.type & vscode.FileType.File)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === 'folder')
+										{
+											let entry = await vscode.workspace.fs.stat(uri);
+											if (entry.type & vscode.FileType.Directory)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === undefined)
+										{
+											found = true;
+											break;
+										}
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileCreate>{uri: uri.toString(true)});
+							}
+						}
+
+						sendRequest("workspace/willCreateFiles", params);
+					});
+				}
+
+				if (fileOperations.willRename)
+				{
+					let willRename = fileOperations.willRename;
+
+					vscode.workspace.onWillRenameFiles(async e => {
+						let params = <lsp.RenameFilesParams> {};
+
+						params.files = [];
+
+						let matchmakers = getFilters(willRename.filters);
+
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < willRename.filters.length; ++index)
+							{
+								let filter = willRename.filters[index];
+								if (filter.scheme && filter.scheme === uri.oldUri.scheme)
+								{
+									if (matchmakers[index].match(uri.oldUri.path))
+									{
+										if (filter.pattern.matches === 'file')
+										{
+											let entry = await vscode.workspace.fs.stat(uri.oldUri);
+
+											if (entry.type & vscode.FileType.File)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === 'folder')
+										{
+											let entry = await vscode.workspace.fs.stat(uri.oldUri);
+											if (entry.type & vscode.FileType.Directory)
+											{
+												found = true;
+												break;
+											}
+										}
+										else if (filter.pattern.matches === undefined)
+										{
+											found = true;
+											break;
+										}
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileRename>{oldUri: uri.oldUri.toString(true), newUri: uri.newUri.toString()});
+							}
+						}
+
+						sendRequest("workspace/willRenameFiles", params);
+					});
+				}
+
+				if (fileOperations.willDelete)
+				{	
+					let willDelete = fileOperations.willDelete;
+
+					vscode.workspace.onWillDeleteFiles(async e => {
+						let params = <lsp.DeleteFilesParams> {};
+
+						params.files = [];
+
+						let matchmakers = getFilters(willDelete.filters);
+
+						for (const uri of e.files) {
+							let found = false;
+
+							for (let index = 0; index < willDelete.filters.length; ++index)
+							{
+								let filter = willDelete.filters[index];
+								if (filter.scheme && filter.scheme === uri.scheme)
+								{
+									if (matchmakers[index].match(uri.path))
+									{
+										found = true;
+										break;
+									}
+								}
+							}
+
+							if (found)
+							{
+								params.files.push(<lsp.FileDelete>{uri: uri.toString(true)});
+							}
+						}
+
+						sendRequest("workspace/willDeleteFiles", params);
 					});
 				}
 			}
@@ -2442,6 +2729,120 @@ function onInitializeResponse(request: lsp.RequestMessage, response?: lsp.Respon
 function onShutdownResponse(request: lsp.RequestMessage, response?: lsp.ResponseMessage): boolean
 {
 	sendNotification("exit", {});
+	return true;
+}
+
+function onWillSomethingFilesResponse(request: lsp.RequestMessage, response?: lsp.ResponseMessage): boolean
+{
+	let edit = response?.result as lsp.WorkspaceEdit | null;
+
+	if (edit)
+	{
+		let vEdit = new vscode.WorkspaceEdit();
+
+		if (edit.documentChanges)
+		{
+			for (let i = 0; i < edit.documentChanges.length; ++i) {
+				const v = edit.documentChanges[i];
+				if ("kind" in v)
+				{
+					let meta: vscode.WorkspaceEditEntryMetadata | undefined = undefined;
+
+					if (edit.changeAnnotations && v.annotationId)
+					{
+						let anno = edit.changeAnnotations[v.annotationId];
+						meta = {
+							label: anno.label,
+							needsConfirmation: anno.needsConfirmation !== undefined ? anno.needsConfirmation : false,
+							description: anno.description
+						};
+					}
+
+					switch (v.kind)
+					{
+					case 'create':
+						vEdit.createFile(
+							vscode.Uri.parse(v.uri),
+							{overwrite: v.options?.overwrite, ignoreIfExists: v.options?.ignoreIfExists},
+							meta
+						);
+
+						break;
+
+					case 'rename':
+						vEdit.renameFile(
+							vscode.Uri.parse(v.oldUri),
+							vscode.Uri.parse(v.newUri),
+							{overwrite: v.options?.overwrite, ignoreIfExists: v.options?.ignoreIfExists},
+							meta
+						);
+
+						break;
+
+					case 'delete':
+						vEdit.deleteFile(
+							vscode.Uri.parse(v.uri),
+							{recursive: v.options?.recursive, ignoreIfNotExists: v.options?.ignoreIfNotExists},
+							meta
+						);
+
+						break;
+					}
+				}
+				else
+				{
+					let uri = vscode.Uri.parse(v.textDocument.uri);
+
+					for (let j = 0; j < v.edits.length; ++j) {
+						const x = v.edits[j];
+						let meta: vscode.WorkspaceEditEntryMetadata | undefined = undefined;
+
+						if (edit.changeAnnotations && 'annotationId' in x)
+						{
+							let anno = edit.changeAnnotations[x.annotationId];
+
+							meta = {
+								label: anno.label,
+								needsConfirmation: anno.needsConfirmation !== undefined ? anno.needsConfirmation : false,
+								description: anno.description
+							};
+						}
+
+						vEdit.replace(
+							uri,
+							new vscode.Range(
+								new vscode.Position(x.range.start.line, x.range.start.character),
+								new vscode.Position(x.range.end.line, x.range.end.character)
+							),
+							x.newText,
+							meta
+						);
+					}
+				}
+			}
+		}
+		else if (edit.changes)
+		{
+			for (const k in edit.changes)
+			{
+				let uri = vscode.Uri.parse(k);
+
+				edit.changes[k].forEach(v => {
+					vEdit.replace(
+						uri,
+						new vscode.Range(
+							new vscode.Position(v.range.start.line, v.range.start.character),
+							new vscode.Position(v.range.end.line, v.range.end.character)
+						),
+						v.newText
+					);
+				});
+			}
+		}
+
+		vscode.workspace.applyEdit(vEdit);
+	}
+
 	return true;
 }
 
@@ -2474,11 +2875,120 @@ function onLogTraceNotification(params: any[] | object | undefined)
 {
 	let msg = params as lsp.LogTraceParams;
 
-	traceOutput.appendLine("trace: " + msg.message);
+	traceOutput.appendLine("[Trace - " + new Date().toLocaleString() + "]");
+	traceOutput.appendLine(msg.message);
 	if (msg.verbose !== undefined)
 	{
-		traceOutput.appendLine("details: " + msg.verbose);
+		traceOutput.appendLine("[Details]");
+		traceOutput.appendLine(msg.verbose);
 	}
+
+	traceOutput.appendLine("");
+}
+
+interface DidChangeWatchedFilesMeta
+{
+	watchers: vscode.FileSystemWatcher[]
+}
+
+function getFileEventCallback(eventType: integer): (e: vscode.Uri) => any
+{
+	return e => {
+		let params = <lsp.DidChangeWatchedFilesParams> {
+			changes: [{
+				uri: e.toString(),
+				type: eventType
+			}]
+		};
+
+		sendNotification("workspace/didChangeWatchedFiles", params);
+	};
+}
+
+function onRegisterCapabilityRequest(params?: any[] | object): ClientResponse
+{
+	let ps = params as lsp.RegistrationParams;
+
+	for (let i = 0; i < ps.registrations.length; ++i)
+	{
+		const reg = ps.registrations[i];
+
+		let meta: any;
+		let save = true;
+
+		switch (reg.method)
+		{
+		case "workspace/didChangeWatchedFiles":
+			let options = reg.registerOptions as lsp.DidChangeWatchedFilesRegistrationOptions;
+			let watchers: vscode.FileSystemWatcher[] = [];
+
+			options.watchers.forEach(watcher => {
+				let pattern: vscode.RelativePattern;
+
+				if (typeof watcher.globPattern === "string")
+				{
+					pattern = new vscode.RelativePattern("", watcher.globPattern);
+				}
+				else
+				{
+					if (typeof watcher.globPattern.baseUri === "string")
+					{
+						pattern = new vscode.RelativePattern(watcher.globPattern.baseUri, watcher.globPattern.pattern);
+					}
+					else
+					{
+						let folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(watcher.globPattern.baseUri.uri));
+
+						pattern = new vscode.RelativePattern(
+							folder !== undefined ? folder : vscode.Uri.parse(watcher.globPattern.baseUri.uri),
+							watcher.globPattern.pattern
+						);
+					}
+				}
+
+				let flag = watcher.kind === undefined ? 7 : watcher.kind;
+
+				let w = vscode.workspace.createFileSystemWatcher(
+					pattern,
+					!(flag & lsp.WatchKind.CREATE),
+					!(flag & lsp.WatchKind.CHANGE),
+					!(flag & lsp.WatchKind.DELETE)
+				);
+
+				if (flag & lsp.WatchKind.CREATE)
+				{
+					w.onDidCreate(getFileEventCallback(lsp.FileChangeType.CREATED));
+				}
+
+				if (flag & lsp.WatchKind.CHANGE)
+				{
+					w.onDidChange(getFileEventCallback(lsp.FileChangeType.CHANGED));
+				}
+
+				if (flag & lsp.WatchKind.DELETE)
+				{
+					w.onDidDelete(getFileEventCallback(lsp.FileChangeType.DELETED));
+				}
+
+				watchers.push(w);
+			});
+
+			meta = <DidChangeWatchedFilesMeta> {
+				watchers: watchers
+			};
+			break;
+
+		default:
+			save = false;
+		}
+
+		if (save)
+		{
+			dynamicCapabilities.set(reg.id, {method: reg.method, meta: meta});
+		}
+	}
+
+	return {result: null};
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -2505,10 +3015,16 @@ export function activate(context: vscode.ExtensionContext) {
 	// Response listeners
 	responseListeners.set("initialize", onInitializeResponse);
 	responseListeners.set("shutdown", onShutdownResponse);
+	responseListeners.set("workspace/willCreateFiles", onWillSomethingFilesResponse);
+	responseListeners.set("workspace/willRenameFiles", onWillSomethingFilesResponse);
+	responseListeners.set("workspace/willDeleteFiles", onWillSomethingFilesResponse);
 
 	// Notification Listeners
 	notificationListeners.set("textDocument/publishDiagnostics", onPublishDiagnosticsNotification);
 	notificationListeners.set("$/logTrace", onLogTraceNotification);
+
+	// Request listeners
+	requestListeners.set("client/registerCapability", onRegisterCapabilityRequest);
 
 	// Initialize server
 	let initializeParams: lsp.InitializeParams = <lsp.InitializeParams>{};
@@ -2541,6 +3057,10 @@ export function activate(context: vscode.ExtensionContext) {
 				didCreate: true,
 				didRename: true,
 				didDelete: true
+			},
+			didChangeWatchedFiles: {
+				dynamicRegistration: true,
+				relativePatternSupport: true
 			}
 		},
 		textDocument: <lsp.TextDocumentClientCapabilities>{
@@ -2555,5 +3075,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 // this method is called when your extension is deactivated
 export function deactivate() {
+	watcher.dispose();
 	sendRequest("shutdown", undefined);
 }
